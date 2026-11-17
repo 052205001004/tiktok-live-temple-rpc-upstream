@@ -1,0 +1,72 @@
+name: Sync upstream
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 20 * * *'
+permissions:
+  contents: write
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UPSTREAM_REPOSITORY: zane-tv/tiktok-live-temple-rpc
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Mirror upstream branches and tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir mirror
+          cd mirror
+          git init --bare
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git config http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+          git remote add upstream "https://github.com/$UPSTREAM_REPOSITORY.git"
+          git remote add destination "https://github.com/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags upstream '+refs/heads/*:refs/remotes/upstream/*' '+refs/tags/*:refs/tags/*'
+          refspecs=()
+          while IFS= read -r ref; do
+            branch=${ref#refs/remotes/upstream/}
+            if [[ "$branch" == "sync-control" ]]; then
+              echo 'Reserved branch collision: sync-control' >&2
+              exit 1
+            fi
+            refspecs+=("+$ref:refs/heads/$branch")
+          done < <(git for-each-ref --format='%(refname)' refs/remotes/upstream/)
+          while IFS= read -r ref; do
+            refspecs+=("+$ref:$ref")
+          done < <(git for-each-ref --format='%(refname)' refs/tags/)
+          git push --atomic destination "${refspecs[@]}"
+          for spec in "${refspecs[@]}"; do
+            spec=${spec#+}
+            src=${spec%%:*}
+            dst=${spec#*:}
+            expected=$(git rev-parse "$src")
+            actual=$(git ls-remote destination "$dst" | awk 'NR==1 { print $1 }')
+            [[ "$expected" == "$actual" ]] || { echo "Verification failed: $dst" >&2; exit 1; }
+          done
+          echo "Verified ${#refspecs[@]} upstream branch/tag references." >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the scheduled sync active
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir control
+          cd control
+          git init
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git config http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git fetch --depth=1 origin sync-control
+          git checkout -B sync-control FETCH_HEAD
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          date -u +%Y-%m > .sync-heartbeat
+          git add .sync-heartbeat
+          if ! git diff --cached --quiet; then
+            git commit -m 'Maintain upstream sync schedule'
+            git push origin HEAD:sync-control
+          fi
